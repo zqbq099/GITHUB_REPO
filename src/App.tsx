@@ -1,24 +1,263 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { UploadCloud, Code2, Cpu, FileArchive, CheckCircle, AlertCircle, Loader2, Download, Smartphone, StopCircle, Trash2, RefreshCw } from 'lucide-react';
+import { 
+  UploadCloud, Code2, Cpu, FileArchive, CheckCircle, AlertCircle, 
+  Loader2, Download, Smartphone, StopCircle, Trash2, RefreshCw, 
+  Rocket, Settings, Grid, MessageSquare, Play, Sparkles, LayoutTemplate,
+  X, Send, Mic, Paperclip, Moon, Sun, Palette, Volume2, Play as PlayIcon,
+  PlusCircle, Save, Archive, History, LogOut, User, LogIn
+} from 'lucide-react';
 import { GoogleGenAI } from '@google/genai';
+import ReactMarkdown from 'react-markdown';
+import JSZip from 'jszip';
+import { auth, db, loginWithGoogle, loginAnonymously, logout } from './firebase';
+import { onAuthStateChanged, User as FirebaseUser } from 'firebase/auth';
+import { doc, setDoc, getDoc, collection, query, where, onSnapshot, serverTimestamp, deleteDoc, getDocs } from 'firebase/firestore';
 
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+enum OperationType {
+  CREATE = 'create',
+  UPDATE = 'update',
+  DELETE = 'delete',
+  LIST = 'list',
+  GET = 'get',
+  WRITE = 'write',
+}
 
-type Tab = 'upload' | 'code';
+interface FirestoreErrorInfo {
+  error: string;
+  operationType: OperationType;
+  path: string | null;
+  authInfo: {
+    userId?: string;
+    email?: string | null;
+    emailVerified?: boolean;
+    isAnonymous?: boolean;
+    tenantId?: string | null;
+    providerInfo?: {
+      providerId: string;
+      displayName: string | null;
+      email: string | null;
+      photoUrl: string | null;
+    }[];
+  }
+}
+
+function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null) {
+  const errInfo: FirestoreErrorInfo = {
+    error: error instanceof Error ? error.message : String(error),
+    authInfo: {
+      userId: auth.currentUser?.uid,
+      email: auth.currentUser?.email,
+      emailVerified: auth.currentUser?.emailVerified,
+      isAnonymous: auth.currentUser?.isAnonymous,
+      tenantId: auth.currentUser?.tenantId,
+      providerInfo: auth.currentUser?.providerData.map(provider => ({
+        providerId: provider.providerId,
+        displayName: provider.displayName,
+        email: provider.email,
+        photoUrl: provider.photoURL
+      })) || []
+    },
+    operationType,
+    path
+  }
+  console.error('Firestore Error: ', JSON.stringify(errInfo));
+  throw new Error(JSON.stringify(errInfo));
+}
+
+const ai = new GoogleGenAI({ apiKey: import.meta.env.VITE_GEMINI_API_KEY || process.env.GEMINI_API_KEY });
+
+type ViewMode = 'create' | 'gallery';
 type BuildState = 'idle' | 'analyzing' | 'compiling' | 'success' | 'error';
 
+interface AppHistoryItem {
+  id: number;
+  name: string;
+  version: string;
+  artifactId: string | null;
+  url: string | null;
+  date: string;
+}
+
+interface ChatMessage {
+  role: 'user' | 'model';
+  text: string;
+  attachments?: {data: string, mimeType: string, name: string}[];
+  emotion?: string;
+  stickers?: string[];
+}
+
+interface ChatSession {
+  id: string;
+  title: string;
+  date: string;
+  messages: ChatMessage[];
+}
+
 export default function App() {
-  const [activeTab, setActiveTab] = useState<Tab>('code');
+  const [viewMode, setViewMode] = useState<ViewMode>('create');
+  
+  // App Data
+  const [appName, setAppName] = useState('تطبيق التمور الذكي');
+  const [appVersion, setAppVersion] = useState('1.0.0');
+  const [appIcon, setAppIcon] = useState<string | null>(null);
+  
+  // Inputs
   const [code, setCode] = useState('');
   const [files, setFiles] = useState<File[]>([]);
+  
+  // States
   const [buildState, setBuildState] = useState<BuildState>('idle');
   const [buildProgress, setBuildProgress] = useState(0);
-  const [aiReport, setAiReport] = useState('');
   const [errorMessage, setErrorMessage] = useState<string>('');
+  const [runUrl, setRunUrl] = useState<string | null>(null);
+  const [artifactId, setArtifactId] = useState<string | null>(null);
+  const [appHistory, setAppHistory] = useState<AppHistoryItem[]>([]);
+  
+  // Chat Advanced States
+  const [isChatOpen, setIsChatOpen] = useState(false);
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([
+    { role: 'model', text: 'أهلاً بك يا صديقي! أنا كعبول، مساعدك الذكي. كيف يمكنني مساعدتك اليوم؟', emotion: 'SMILE' }
+  ]);
+  const [chatInput, setChatInput] = useState('');
+  const [isChatLoading, setIsChatLoading] = useState(false);
+  const [theme, setTheme] = useState<'dark' | 'light'>('dark');
+  const [accentColor, setAccentColor] = useState('#06b6d4');
+  const [attachments, setAttachments] = useState<{data: string, mimeType: string, name: string}[]>([]);
+  const [isRecording, setIsRecording] = useState(false);
+  const [avatarEmotion, setAvatarEmotion] = useState<'NORMAL' | 'SMILE' | 'THINK' | 'LAUGH'>('SMILE');
+  const [sandboxCode, setSandboxCode] = useState<{code: string, type: string} | null>(null);
+  const [showSettings, setShowSettings] = useState(false);
+  
+  // Developer & History States
+  const [systemPrompt, setSystemPrompt] = useState("أنت كعبول، مساعد ذكي وودود. ابدأ دائماً رسالتك بتعبير وجه بين قوسين مربعين: [NORMAL] أو [SMILE] أو [THINK] أو [LAUGH]. يمكنك استخدام ملصقات بكتابة [STICKER:thumbs_up] أو [STICKER:rocket] أو [STICKER:heart]. أجب على أسئلة المستخدم بحرية.");
+  const [temperature, setTemperature] = useState<number>(1.0);
+  const [chatSessions, setChatSessions] = useState<ChatSession[]>([]);
+  const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
+  const [showArchive, setShowArchive] = useState(false);
+  
+  // Auth States
+  const [user, setUser] = useState<FirebaseUser | null>(null);
+  const [isAuthReady, setIsAuthReady] = useState(false);
+  const [showAuthModal, setShowAuthModal] = useState(false);
+
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
+      setUser(currentUser);
+      setIsAuthReady(true);
+      
+      if (currentUser) {
+        // Load user settings
+        try {
+          const userDocRef = doc(db, 'users', currentUser.uid);
+          const userDoc = await getDoc(userDocRef);
+          if (userDoc.exists()) {
+            const data = userDoc.data();
+            if (data.theme) setTheme(data.theme);
+            if (data.accentColor) setAccentColor(data.accentColor);
+            if (data.systemPrompt) setSystemPrompt(data.systemPrompt);
+            if (data.temperature !== undefined) setTemperature(data.temperature);
+          } else {
+            // Create default profile
+            await setDoc(userDocRef, {
+              uid: currentUser.uid,
+              theme,
+              accentColor,
+              systemPrompt,
+              temperature,
+              createdAt: serverTimestamp()
+            });
+          }
+        } catch (error) {
+          handleFirestoreError(error, OperationType.GET, `users/${currentUser.uid}`);
+        }
+      } else {
+        // Reset settings if logged out
+        setChatSessions([]);
+        setCurrentSessionId(null);
+        setChatMessages([{ role: 'model', text: 'أهلاً بك يا صديقي! أنا كعبول، مساعدك الذكي. يرجى تسجيل الدخول لحفظ محادثاتك.', emotion: 'SMILE' }]);
+      }
+    });
+
+    return () => unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    if (!isAuthReady || !user) return;
+
+    const q = query(collection(db, 'chatSessions'), where('userId', '==', user.uid));
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const sessions: ChatSession[] = [];
+      snapshot.forEach((doc) => {
+        sessions.push(doc.data() as ChatSession);
+      });
+      // Sort by date descending (assuming date string is sortable or we use createdAt, but let's just sort by id for now as it's timestamp based)
+      sessions.sort((a, b) => Number(b.id) - Number(a.id));
+      setChatSessions(sessions);
+    }, (error) => {
+      handleFirestoreError(error, OperationType.LIST, 'chatSessions');
+    });
+
+    return () => unsubscribe();
+  }, [isAuthReady, user]);
+
+  // Save settings when they change
+  useEffect(() => {
+    if (!isAuthReady || !user) return;
+    const saveSettings = async () => {
+      try {
+        await setDoc(doc(db, 'users', user.uid), {
+          uid: user.uid,
+          theme,
+          accentColor,
+          systemPrompt,
+          temperature,
+          // createdAt is immutable, so we don't update it here. setDoc with merge: true is better
+        }, { merge: true });
+      } catch (error) {
+        console.error("Failed to save settings", error);
+      }
+    };
+    saveSettings();
+  }, [theme, accentColor, systemPrompt, temperature, isAuthReady, user]);
+
+  
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const iconInputRef = useRef<HTMLInputElement>(null);
   const pollIntervalRef = useRef<any>(null);
   const isCancelledRef = useRef(false);
+  const chatEndRef = useRef<HTMLDivElement>(null);
+
+  // Scroll chat to bottom
+  useEffect(() => {
+    if (isChatOpen && chatEndRef.current) {
+      chatEndRef.current.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [chatMessages, isChatOpen]);
+
+  // Load history on mount
+  useEffect(() => {
+    const saved = localStorage.getItem('kaabool_history');
+    if (saved) {
+      try { setAppHistory(JSON.parse(saved)); } catch (e) {}
+    }
+  }, []);
+
+  const saveToHistory = (item: Omit<AppHistoryItem, 'id' | 'date'>) => {
+    const newItem: AppHistoryItem = {
+      ...item,
+      id: Date.now(),
+      date: new Date().toLocaleDateString('ar-SA')
+    };
+    const updated = [newItem, ...appHistory];
+    setAppHistory(updated);
+    localStorage.setItem('kaabool_history', JSON.stringify(updated));
+  };
+
+  const clearHistory = () => {
+    setAppHistory([]);
+    localStorage.removeItem('kaabool_history');
+  };
 
   const stopBuild = () => {
     isCancelledRef.current = true;
@@ -27,463 +266,950 @@ export default function App() {
     setErrorMessage('تم إيقاف المهمة يدوياً');
   };
 
-  const deleteTask = () => {
+  const restartApp = () => {
     isCancelledRef.current = true;
     if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
     setBuildState('idle');
     setBuildProgress(0);
-    setAiReport('');
     setErrorMessage('');
-  };
-
-  const restartApp = () => {
-    deleteTask();
-    setCode('');
-    setFiles([]);
-    setActiveTab('code');
+    setRunUrl(null);
+    setArtifactId(null);
   };
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files) {
-      setFiles(Array.from(e.target.files));
+    if (e.target.files) setFiles(Array.from(e.target.files));
+  };
+
+  const handleIconChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files && e.target.files[0]) {
+      const reader = new FileReader();
+      reader.onloadend = () => setAppIcon(reader.result as string);
+      reader.readAsDataURL(e.target.files[0]);
     }
   };
 
-  const handleDragOver = (e: React.DragEvent) => {
-    e.preventDefault();
+  // --- Voice & File Logic ---
+  const startRecording = () => {
+    const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+      alert('متصفحك لا يدعم التعرف على الصوت');
+      return;
+    }
+    const recognition = new SpeechRecognition();
+    recognition.lang = 'ar-SA';
+    recognition.onstart = () => setIsRecording(true);
+    recognition.onresult = (event: any) => {
+      const transcript = event.results[0][0].transcript;
+      setChatInput(prev => prev + ' ' + transcript);
+    };
+    recognition.onend = () => setIsRecording(false);
+    recognition.start();
   };
 
-  const handleDrop = (e: React.DragEvent) => {
-    e.preventDefault();
-    if (e.dataTransfer.files) {
-      setFiles(Array.from(e.dataTransfer.files));
+  const speakText = (text: string) => {
+    if ('speechSynthesis' in window) {
+      window.speechSynthesis.cancel();
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.lang = 'ar-SA';
+      window.speechSynthesis.speak(utterance);
     }
   };
 
-  const [showSetup, setShowSetup] = useState(false);
+  const getMimeType = (filename: string) => {
+    const ext = filename.split('.').pop()?.toLowerCase();
+    switch(ext) {
+      case 'png': return 'image/png';
+      case 'jpg': case 'jpeg': return 'image/jpeg';
+      case 'pdf': return 'application/pdf';
+      case 'js': case 'jsx': case 'ts': case 'tsx': return 'text/javascript';
+      case 'html': return 'text/html';
+      case 'css': return 'text/css';
+      case 'json': return 'application/json';
+      default: return 'text/plain';
+    }
+  };
 
+  const handleChatFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (!files) return;
+    
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+      
+      if (file.name.endsWith('.zip') || file.type === 'application/zip') {
+        try {
+          const zip = new JSZip();
+          const loadedZip = await zip.loadAsync(file);
+          
+          const extractedAttachments: {data: string, mimeType: string, name: string}[] = [];
+          
+          for (const [relativePath, zipEntry] of Object.entries(loadedZip.files)) {
+            if (zipEntry.dir) continue; // Skip directories
+            
+            // Ignore common hidden files/folders like .DS_Store or __MACOSX
+            if (relativePath.includes('__MACOSX') || relativePath.includes('.DS_Store')) continue;
+
+            const base64Data = await zipEntry.async('base64');
+            extractedAttachments.push({
+              data: base64Data,
+              mimeType: getMimeType(relativePath),
+              name: relativePath.split('/').pop() || relativePath // Get just the filename
+            });
+          }
+          
+          setAttachments(prev => [...prev, ...extractedAttachments]);
+        } catch (error) {
+          console.error("Error unzipping file:", error);
+          alert("حدث خطأ أثناء فك ضغط الملف.");
+        }
+      } else {
+        const reader = new FileReader();
+        reader.onloadend = () => {
+          setAttachments(prev => [...prev, {
+            data: (reader.result as string).split(',')[1],
+            mimeType: file.type || getMimeType(file.name),
+            name: file.name
+          }]);
+        };
+        reader.readAsDataURL(file);
+      }
+    }
+  };
+
+  // --- Chat History Logic ---
+  const handleNewChat = () => {
+    setCurrentSessionId(null);
+    setChatMessages([{ role: 'model', text: 'أهلاً بك يا صديقي! أنا كعبول، مساعدك الذكي. كيف يمكنني مساعدتك اليوم؟', emotion: 'SMILE' }]);
+    setShowArchive(false);
+    setAvatarEmotion('SMILE');
+  };
+
+  const handleSaveChat = async () => {
+    if (!user) {
+      setShowAuthModal(true);
+      return;
+    }
+    if (chatMessages.length <= 1) return; // Don't save empty chats
+    
+    try {
+      if (currentSessionId) {
+        await setDoc(doc(db, 'chatSessions', currentSessionId), {
+          id: currentSessionId,
+          userId: user.uid,
+          title: chatSessions.find(s => s.id === currentSessionId)?.title || 'محادثة',
+          date: new Date().toLocaleString('ar-SA'),
+          messages: chatMessages,
+        }, { merge: true });
+      } else {
+        const newId = Date.now().toString();
+        const firstUserMsg = chatMessages.find(m => m.role === 'user')?.text || 'محادثة جديدة';
+        const title = firstUserMsg.length > 30 ? firstUserMsg.substring(0, 30) + '...' : firstUserMsg;
+        
+        await setDoc(doc(db, 'chatSessions', newId), {
+          id: newId,
+          userId: user.uid,
+          title,
+          date: new Date().toLocaleString('ar-SA'),
+          messages: chatMessages,
+          createdAt: serverTimestamp()
+        });
+        setCurrentSessionId(newId);
+      }
+    } catch (error) {
+      handleFirestoreError(error, OperationType.WRITE, 'chatSessions');
+    }
+  };
+
+  const handleLoadChat = (session: ChatSession) => {
+    setCurrentSessionId(session.id);
+    setChatMessages(session.messages);
+    setShowArchive(false);
+  };
+
+  const handleDeleteChat = async (id: string) => {
+    if (!user) return;
+    try {
+      await deleteDoc(doc(db, 'chatSessions', id));
+      if (currentSessionId === id) {
+        handleNewChat();
+      }
+    } catch (error) {
+      handleFirestoreError(error, OperationType.DELETE, `chatSessions/${id}`);
+    }
+  };
+
+  // --- Chat Logic ---
+  const handleSendMessage = async () => {
+    if (!chatInput.trim() && attachments.length === 0) return;
+    const userMsg = chatInput.trim();
+    setChatInput('');
+    
+    const currentAttachments = [...attachments];
+    setAttachments([]);
+
+    setChatMessages(prev => [...prev, { 
+      role: 'user', 
+      text: userMsg,
+      attachments: currentAttachments
+    }]);
+    setIsChatLoading(true);
+
+    try {
+      const contents = chatMessages.map(msg => ({
+        role: msg.role === 'model' ? 'model' : 'user',
+        parts: [
+          { text: msg.text },
+          ...(msg.attachments?.map(a => ({
+            inlineData: { data: a.data, mimeType: a.mimeType }
+          })) || [])
+        ]
+      }));
+      
+      contents.push({ 
+        role: 'user', 
+        parts: [
+          { text: userMsg },
+          ...(currentAttachments.map(a => ({
+            inlineData: { data: a.data, mimeType: a.mimeType }
+          })))
+        ] 
+      });
+
+      const response = await ai.models.generateContent({
+        model: 'gemini-3.1-pro-preview',
+        contents: contents as any,
+        config: {
+          systemInstruction: systemPrompt,
+          temperature: temperature
+        }
+      });
+
+      let rawText = response.text || '';
+      const emotionMatch = rawText.match(/^\[(NORMAL|SMILE|THINK|LAUGH)\]/i);
+      let emotion = 'NORMAL';
+      if (emotionMatch) {
+        emotion = emotionMatch[1].toUpperCase();
+        rawText = rawText.replace(emotionMatch[0], '').trim();
+      }
+      
+      const stickerRegex = /\[STICKER:([a-z_]+)\]/gi;
+      const stickers: string[] = [];
+      let match;
+      while ((match = stickerRegex.exec(rawText)) !== null) {
+        stickers.push(match[1]);
+      }
+      const cleanText = rawText.replace(stickerRegex, '').trim();
+
+      setAvatarEmotion(emotion as any);
+      setChatMessages(prev => [...prev, { 
+        role: 'model', 
+        text: cleanText,
+        emotion,
+        stickers
+      }]);
+    } catch (error: any) {
+      console.error(error);
+      let errorMessage = 'عذراً، حدث خطأ في الاتصال. حاول مرة أخرى.';
+      
+      if (error?.status === 429 || error?.message?.includes('429') || error?.message?.includes('RESOURCE_EXHAUSTED')) {
+        errorMessage = 'عذراً، لقد تجاوزت الحد المسموح به للاستخدام (Quota Exceeded). يرجى التحقق من خطة الفوترة الخاصة بك أو المحاولة لاحقاً.';
+      }
+      
+      setChatMessages(prev => [...prev, { role: 'model', text: errorMessage }]);
+    } finally {
+      setIsChatLoading(false);
+    }
+  };
+
+  // --- Build Process ---
   const startBuild = async () => {
-    if (activeTab === 'code' && !code.trim()) return;
-    if (activeTab === 'upload' && files.length === 0) return;
+    if (!code.trim()) return;
 
     isCancelledRef.current = false;
     setBuildState('analyzing');
     setBuildProgress(10);
-    setAiReport('');
     setErrorMessage('');
+    setRunUrl(null);
+    setArtifactId(null);
 
     try {
-      // 1. AI Analysis
-      const prompt = `
-        أنت المساعد الذكي "كعبول". قام المستخدم بطلب تحويل كود برمجي إلى تطبيق أندرويد (APK).
-        قم بتحليل الكود التالي أو وصف الملفات المرفقة باختصار شديد (سطرين كحد أقصى) واذكر ما يفعله التطبيق وما إذا كان يبدو صالحاً للعمل.
-        
-        الكود/الملفات:
-        ${activeTab === 'code' ? code.substring(0, 2000) : files.map(f => f.name).join(', ')}
-      `;
-
-      const aiResponse = await ai.models.generateContent({
-        model: 'gemini-3-flash-preview',
-        contents: prompt,
-      });
-
-      if (isCancelledRef.current) return;
-
-      setAiReport(aiResponse.text || 'تم تحليل الكود بنجاح.');
       setBuildProgress(30);
-
-      // 2. Trigger GitHub Build via Backend
       setBuildState('compiling');
+
+      // 2. Trigger Backend
       const response = await fetch('/api/build', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ code, files: files.map(f => f.name) }),
+        body: JSON.stringify({ 
+          code, 
+          files: files.map(f => f.name),
+          metadata: { name: appName, version: appVersion, icon: appIcon }
+        }),
       });
 
       if (isCancelledRef.current) return;
 
       if (!response.ok) {
         const error = await response.json();
-        if (error.error && error.error.includes('GitHub configuration missing')) {
-          // Fallback to simulation mode if GitHub is not configured
-          setAiReport(prev => prev + '\n\n⚠️ تنبيه: لم يتم ربط GitHub في الإعدادات. سيتم تشغيل وضع المحاكاة الوهمي لتجربة الواجهة.');
-          
-          await new Promise(r => setTimeout(r, 1500));
-          if (isCancelledRef.current) return;
-          setBuildProgress(60);
-          
-          await new Promise(r => setTimeout(r, 1500));
-          if (isCancelledRef.current) return;
-          setBuildProgress(85);
-
-          await new Promise(r => setTimeout(r, 1500));
-          if (isCancelledRef.current) return;
-          setBuildProgress(100);
-          setBuildState('success');
-          return;
-        }
         throw new Error(error.error || 'فشل في بدء عملية البناء');
       }
 
-      // 3. Poll for Status
+      const buildData = await response.json();
+      const commitSha = buildData.sha;
+
+      // 3. Polling
       let notFoundCount = 0;
       pollIntervalRef.current = setInterval(async () => {
         if (isCancelledRef.current) {
-          if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
+          clearInterval(pollIntervalRef.current);
           return;
         }
         try {
-          const statusRes = await fetch('/api/build/status');
+          const statusRes = await fetch(`/api/build/status${commitSha ? `?sha=${commitSha}` : ''}`);
           const statusData = await statusRes.json();
 
           if (statusData.status === 'not_found') {
             notFoundCount++;
-            if (notFoundCount > 12) { // Timeout after 60 seconds
-              if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
+            if (notFoundCount > 12) {
+              clearInterval(pollIntervalRef.current);
               setBuildState('error');
-              setErrorMessage('لم يبدأ البناء. تأكد من إضافة ملف android.yml في مجلد .github/workflows في مستودعك.');
+              setErrorMessage('لم يبدأ البناء. تأكد من إعدادات GitHub.');
             }
           } else if (statusData.status === 'in_progress' || statusData.status === 'queued') {
+            setRunUrl(statusData.url);
             setBuildProgress(prev => Math.min(prev + 5, 90));
           } else if (statusData.status === 'completed') {
-            if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
+            clearInterval(pollIntervalRef.current);
+            setRunUrl(statusData.url);
             if (statusData.conclusion === 'success') {
+              setArtifactId(statusData.artifactId);
               setBuildProgress(100);
               setBuildState('success');
+              saveToHistory({
+                name: appName,
+                version: appVersion,
+                artifactId: statusData.artifactId,
+                url: statusData.url
+              });
             } else {
               setBuildState('error');
-              setErrorMessage('فشل البناء على GitHub. يرجى مراجعة سجلات الأخطاء هناك.');
+              setErrorMessage('فشل البناء على GitHub.');
             }
           }
         } catch (e) {
-          console.error("Polling error:", e);
+          console.error(e);
         }
       }, 5000);
 
     } catch (error: any) {
       if (isCancelledRef.current) return;
-      console.error(error);
       setErrorMessage(error.message || 'حدث خطأ غير معروف');
       setBuildState('error');
     }
   };
 
-  const downloadDummyAPK = () => {
-    const element = document.createElement("a");
-    const file = new Blob(["This is a simulated APK file generated by Kaabool AI."], {type: 'application/vnd.android.package-archive'});
-    element.href = URL.createObjectURL(file);
-    element.download = "Kaabool_App.apk";
-    document.body.appendChild(element); // Required for this to work in FireFox
-    element.click();
-  };
-
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-200 font-sans" dir="rtl">
-      {/* Header */}
-      <header className="border-b border-slate-800 bg-slate-900/50 backdrop-blur-md sticky top-0 z-10">
-        <div className="max-w-5xl mx-auto px-6 h-20 flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <div className="w-12 h-12 bg-indigo-600 rounded-2xl flex items-center justify-center shadow-lg shadow-indigo-500/20">
-              <Cpu className="w-7 h-7 text-white" />
+    <div className="min-h-screen bg-[#0a0f1c] text-slate-200 font-sans selection:bg-cyan-500/30" dir="rtl">
+      {/* Neon Header */}
+      <header className="border-b border-cyan-900/30 bg-[#0a0f1c]/80 backdrop-blur-xl sticky top-0 z-50">
+        <div className="max-w-7xl mx-auto px-6 h-20 flex items-center justify-between">
+          <div className="flex items-center gap-4">
+            <div className="relative">
+              <div className="absolute inset-0 bg-cyan-500 blur-lg opacity-50 rounded-full animate-pulse"></div>
+              <div className="relative w-12 h-12 bg-gradient-to-br from-cyan-500 to-blue-600 rounded-2xl flex items-center justify-center border border-cyan-400/50 shadow-[0_0_15px_rgba(6,182,212,0.5)]">
+                <Cpu className="w-7 h-7 text-white" />
+              </div>
             </div>
             <div>
-              <h1 className="text-2xl font-bold bg-gradient-to-l from-indigo-400 to-cyan-400 bg-clip-text text-transparent">
-                كعبول
+              <h1 className="text-2xl font-bold text-transparent bg-clip-text bg-gradient-to-l from-cyan-300 to-blue-500 drop-shadow-[0_0_8px_rgba(34,211,238,0.4)]">
+                كعبول برو
               </h1>
-              <p className="text-xs text-slate-400">صانع تطبيقات الأندرويد الذكي</p>
+              <p className="text-xs text-cyan-500/80 font-medium tracking-wider">AI APP BUILDER</p>
             </div>
           </div>
-          <div className="flex items-center gap-4">
+          
+          <div className="flex bg-slate-900/50 p-1 rounded-xl border border-slate-800">
             <button 
-              onClick={() => setShowSetup(!showSetup)}
-              className="text-xs text-indigo-400 hover:text-indigo-300 bg-indigo-500/10 px-3 py-1.5 rounded-lg border border-indigo-500/20 transition-colors"
+              onClick={() => setViewMode('create')}
+              className={`px-6 py-2 rounded-lg text-sm font-bold transition-all ${viewMode === 'create' ? 'bg-cyan-500/20 text-cyan-300 shadow-[0_0_10px_rgba(6,182,212,0.2)]' : 'text-slate-400 hover:text-slate-200'}`}
             >
-              إعدادات الربط
+              المصنع
             </button>
-            <div className="hidden sm:flex items-center gap-2 text-sm text-slate-400 bg-slate-800/50 px-4 py-2 rounded-full">
-              <Smartphone className="w-4 h-4" />
-              <span>جاهز لتحويل أفكارك إلى APK</span>
-            </div>
+            <button 
+              onClick={() => setViewMode('gallery')}
+              className={`px-6 py-2 rounded-lg text-sm font-bold transition-all ${viewMode === 'gallery' ? 'bg-cyan-500/20 text-cyan-300 shadow-[0_0_10px_rgba(6,182,212,0.2)]' : 'text-slate-400 hover:text-slate-200'}`}
+            >
+              معرض تطبيقاتي
+            </button>
           </div>
         </div>
       </header>
 
-      <main className="max-w-3xl mx-auto px-6 py-12">
+      <main className="max-w-7xl mx-auto px-6 py-8">
         
-        {/* Setup Instructions Modal/Section */}
-        <AnimatePresence>
-          {showSetup && (
-            <motion.div
-              initial={{ opacity: 0, scale: 0.95 }}
-              animate={{ opacity: 1, scale: 1 }}
-              exit={{ opacity: 0, scale: 0.95 }}
-              className="mb-8 bg-indigo-950/30 border border-indigo-500/30 rounded-3xl p-6 relative overflow-hidden"
-            >
-              <div className="absolute top-0 right-0 w-32 h-32 bg-indigo-500/10 blur-3xl rounded-full -mr-16 -mt-16" />
-              <h3 className="text-lg font-bold text-indigo-300 mb-4 flex items-center gap-2">
-                <AlertCircle className="w-5 h-5" />
-                كيفية تفعيل "كعبول" الحقيقي
-              </h3>
-              <div className="space-y-4 text-sm text-slate-300 leading-relaxed text-right">
-                <p>1. قم بإنشاء مستودع (Repository) جديد على GitHub.</p>
-                <p>2. أضف ملفاً في المسار <code className="bg-slate-900 px-2 py-0.5 rounded text-indigo-400">.github/workflows/android.yml</code> يحتوي على كود بناء الأندرويد.</p>
-                <p>3. قم بتوليد **Personal Access Token** من إعدادات GitHub وأضفه في ملف <code className="bg-slate-900 px-2 py-0.5 rounded text-indigo-400">.env</code> الخاص بالتطبيق.</p>
-                <p>4. تأكد من ضبط <code className="bg-slate-900 px-2 py-0.5 rounded text-indigo-400">GITHUB_REPO</code> في الإعدادات ليكون باسم مستودعك.</p>
+        {viewMode === 'gallery' ? (
+          /* --- GALLERY VIEW --- */
+          <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} className="space-y-6">
+            <div className="flex justify-between items-center mb-8">
+              <h2 className="text-3xl font-bold text-white flex items-center gap-3">
+                <Grid className="w-8 h-8 text-cyan-400" />
+                تطبيقاتك الجاهزة
+              </h2>
+              {appHistory.length > 0 && (
+                <button onClick={clearHistory} className="text-red-400 hover:text-red-300 text-sm flex items-center gap-2 bg-red-500/10 px-4 py-2 rounded-lg">
+                  <Trash2 className="w-4 h-4" /> مسح السجل
+                </button>
+              )}
+            </div>
+            
+            {appHistory.length === 0 ? (
+              <div className="text-center py-20 bg-slate-900/50 rounded-3xl border border-slate-800">
+                <LayoutTemplate className="w-16 h-16 text-slate-600 mx-auto mb-4" />
+                <h3 className="text-xl text-slate-400">لم تقم ببناء أي تطبيقات بعد</h3>
+                <button onClick={() => setViewMode('create')} className="mt-4 text-cyan-400 hover:underline">اذهب للمصنع لتبدأ</button>
               </div>
-            </motion.div>
-          )}
-        </AnimatePresence>
-        
-        {/* Intro */}
-        <div className="text-center mb-12">
-          <h2 className="text-3xl font-bold text-white mb-4">ارفع مشروعك، وسيتكفل كعبول بالباقي</h2>
-          <p className="text-slate-400 max-w-xl mx-auto leading-relaxed">
-            قم برفع ملفات مشروعك أو الصق الكود البرمجي الخاص بك. سيقوم الذكاء الاصطناعي بتحليل الكود وتجميعه وتحويله إلى ملف APK جاهز للتثبيت على هاتفك.
-          </p>
-        </div>
+            ) : (
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                {appHistory.map((app) => (
+                  <div key={app.id} className="bg-slate-900 border border-slate-800 hover:border-cyan-500/50 transition-all rounded-2xl p-6 relative overflow-hidden group">
+                    <div className="absolute top-0 right-0 w-32 h-32 bg-cyan-500/5 blur-3xl rounded-full group-hover:bg-cyan-500/10 transition-colors" />
+                    <div className="flex justify-between items-start mb-4 relative">
+                      <div className="w-12 h-12 bg-gradient-to-br from-slate-800 to-slate-900 rounded-xl flex items-center justify-center border border-slate-700">
+                        <Smartphone className="w-6 h-6 text-cyan-400" />
+                      </div>
+                      <span className="text-xs text-slate-500 bg-slate-950 px-2 py-1 rounded-md">{app.date}</span>
+                    </div>
+                    <h3 className="text-xl font-bold text-white mb-1 relative">{app.name}</h3>
+                    <p className="text-sm text-slate-400 mb-6 relative">الإصدار: {app.version}</p>
+                    
+                    {app.artifactId ? (
+                      <a href={`/api/download/${app.artifactId}`} className="w-full bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-400 border border-cyan-500/30 py-2.5 rounded-xl flex items-center justify-center gap-2 transition-all font-medium">
+                        <Download className="w-4 h-4" /> تحميل APK
+                      </a>
+                    ) : (
+                      <a href={app.url || '#'} target="_blank" rel="noopener noreferrer" className="w-full bg-slate-800 hover:bg-slate-700 text-slate-300 py-2.5 rounded-xl flex items-center justify-center gap-2 transition-all font-medium">
+                        عرض في GitHub
+                      </a>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </motion.div>
+        ) : (
+          /* --- CREATE VIEW --- */
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
+            
+            {/* Left Column: Controls & Input (8 cols) */}
+            <div className="lg:col-span-7 space-y-6">
+              
+              {/* App Settings */}
+              <div className="bg-slate-900/80 backdrop-blur-md border border-slate-800 rounded-3xl p-6 shadow-xl">
+                <h3 className="text-lg font-bold text-white mb-4 flex items-center gap-2">
+                  <Settings className="w-5 h-5 text-cyan-400" /> إعدادات التطبيق
+                </h3>
+                <div className="grid grid-cols-2 gap-4 mb-4">
+                  <div>
+                    <label className="block text-xs font-medium text-slate-400 mb-1.5">اسم التطبيق</label>
+                    <input type="text" value={appName} onChange={(e) => setAppName(e.target.value)} className="w-full bg-[#0a0f1c] border border-slate-700 rounded-xl px-4 py-2.5 text-sm text-white focus:ring-2 focus:ring-cyan-500 outline-none transition-all" />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-slate-400 mb-1.5">الإصدار</label>
+                    <input type="text" value={appVersion} onChange={(e) => setAppVersion(e.target.value)} className="w-full bg-[#0a0f1c] border border-slate-700 rounded-xl px-4 py-2.5 text-sm text-white focus:ring-2 focus:ring-cyan-500 outline-none transition-all" />
+                  </div>
+                </div>
+                
+                {/* File & Icon Uploads */}
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-xs font-medium text-slate-400 mb-1.5">أيقونة التطبيق (اختياري)</label>
+                    <input type="file" accept="image/png, image/jpeg" ref={iconInputRef} onChange={handleIconChange} className="hidden" />
+                    <button onClick={() => iconInputRef.current?.click()} className="w-full bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-xl px-4 py-2.5 text-sm text-slate-300 flex items-center justify-center gap-2 transition-all">
+                      <Palette className="w-4 h-4" /> {appIcon ? 'تم اختيار الأيقونة' : 'اختر أيقونة'}
+                    </button>
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-slate-400 mb-1.5">ملفات إضافية (صور، خطوط...)</label>
+                    <input type="file" multiple ref={fileInputRef} onChange={handleFileChange} className="hidden" />
+                    <button onClick={() => fileInputRef.current?.click()} className="w-full bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-xl px-4 py-2.5 text-sm text-slate-300 flex items-center justify-center gap-2 transition-all">
+                      <UploadCloud className="w-4 h-4" /> {files.length > 0 ? `تم اختيار ${files.length} ملف` : 'اختر ملفات'}
+                    </button>
+                  </div>
+                </div>
+              </div>
 
-        {/* Main Card */}
-        <div className="bg-slate-900 border border-slate-800 rounded-3xl shadow-2xl overflow-hidden">
-          
-          {/* Tabs */}
-          <div className="flex border-b border-slate-800">
-            <button
-              onClick={() => setActiveTab('code')}
-              className={`flex-1 py-4 flex items-center justify-center gap-2 text-sm font-medium transition-colors ${activeTab === 'code' ? 'text-indigo-400 border-b-2 border-indigo-500 bg-indigo-500/5' : 'text-slate-400 hover:text-slate-300 hover:bg-slate-800/50'}`}
-            >
-              <Code2 className="w-5 h-5" />
-              لصق الكود
-            </button>
-            <button
-              onClick={() => setActiveTab('upload')}
-              className={`flex-1 py-4 flex items-center justify-center gap-2 text-sm font-medium transition-colors ${activeTab === 'upload' ? 'text-indigo-400 border-b-2 border-indigo-500 bg-indigo-500/5' : 'text-slate-400 hover:text-slate-300 hover:bg-slate-800/50'}`}
-            >
-              <UploadCloud className="w-5 h-5" />
-              رفع الملفات
-            </button>
-          </div>
+              {/* Input Area */}
+              <div className="bg-slate-900/80 backdrop-blur-md border border-slate-800 rounded-3xl overflow-hidden shadow-xl flex flex-col h-[500px]">
+                <div className="flex border-b border-slate-800 bg-slate-950/50">
+                  <div className="flex-1 py-3 text-sm font-bold flex items-center justify-center gap-2 text-cyan-400 border-b-2 border-cyan-500 bg-cyan-500/5">
+                    <Code2 className="w-4 h-4" /> الكود المصدري
+                  </div>
+                </div>
 
-          {/* Input Area */}
-          <div className="p-6">
-            <AnimatePresence mode="wait">
-              {activeTab === 'code' ? (
-                <motion.div
-                  key="code"
-                  initial={{ opacity: 0, y: 10 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0, y: -10 }}
-                  className="space-y-4"
-                >
-                  <label className="block text-sm font-medium text-slate-300">الكود البرمجي للتطبيق</label>
+                <div className="flex-1 p-6 overflow-y-auto">
                   <textarea
                     value={code}
                     onChange={(e) => setCode(e.target.value)}
-                    placeholder="الصق كود React Native, Flutter, أو Java/Kotlin هنا..."
-                    className="w-full h-64 bg-slate-950 border border-slate-800 rounded-xl p-4 text-slate-300 font-mono text-sm focus:ring-2 focus:ring-indigo-500 focus:border-transparent outline-none resize-none"
+                    placeholder="الصق كود React Native هنا..."
+                    className="w-full h-full bg-[#0a0f1c] border border-slate-800 rounded-xl p-4 text-cyan-100 font-mono text-sm focus:ring-1 focus:ring-cyan-500 outline-none resize-none"
                     dir="ltr"
                   />
-                </motion.div>
-              ) : (
-                <motion.div
-                  key="upload"
-                  initial={{ opacity: 0, y: 10 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0, y: -10 }}
-                  className="space-y-4"
-                >
-                  <label className="block text-sm font-medium text-slate-300">ملفات المشروع (ZIP أو مجلدات)</label>
-                  <div
-                    onDragOver={handleDragOver}
-                    onDrop={handleDrop}
-                    onClick={() => fileInputRef.current?.click()}
-                    className="w-full h-64 border-2 border-dashed border-slate-700 hover:border-indigo-500 rounded-xl flex flex-col items-center justify-center gap-4 cursor-pointer bg-slate-950/50 transition-colors group"
-                  >
-                    <div className="w-16 h-16 bg-slate-900 rounded-full flex items-center justify-center group-hover:scale-110 transition-transform">
-                      <FileArchive className="w-8 h-8 text-indigo-400" />
-                    </div>
-                    <div className="text-center">
-                      <p className="text-slate-300 font-medium mb-1">اسحب وأفلت الملفات هنا</p>
-                      <p className="text-slate-500 text-sm">أو انقر لاختيار الملفات من جهازك</p>
-                    </div>
-                    <input
-                      type="file"
-                      ref={fileInputRef}
-                      onChange={handleFileChange}
-                      className="hidden"
-                      multiple
+                </div>
+              </div>
+            </div>
+
+            {/* Right Column: Preview & Build (5 cols) */}
+            <div className="lg:col-span-5 space-y-6">
+              
+              {/* Live Preview (Expo Snack) */}
+              <div className="bg-slate-900/80 backdrop-blur-md border border-slate-800 rounded-3xl p-6 shadow-xl flex flex-col h-[500px]">
+                <h3 className="text-lg font-bold text-white mb-4 flex items-center gap-2">
+                  <Play className="w-5 h-5 text-emerald-400" /> التجربة قبل التحميل
+                </h3>
+                
+                <div className="flex-1 bg-black rounded-2xl border-4 border-slate-800 overflow-hidden relative shadow-2xl flex items-center justify-center">
+                  {/* Mobile Notch */}
+                  <div className="absolute top-0 left-1/2 -translate-x-1/2 w-32 h-6 bg-slate-800 rounded-b-xl z-10"></div>
+                  
+                  {code.trim().length > 50 ? (
+                    <iframe 
+                      src={`https://snack.expo.dev/?platform=web&theme=dark&code=${encodeURIComponent(code)}&dependencies=react,react-native`}
+                      className="w-full h-full border-0"
+                      title="Live Preview"
+                      sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
                     />
-                  </div>
-                  {files.length > 0 && (
-                    <div className="bg-slate-950 rounded-lg p-3 border border-slate-800">
-                      <p className="text-sm text-slate-400 mb-2">الملفات المحددة ({files.length}):</p>
-                      <div className="flex flex-wrap gap-2">
-                        {files.slice(0, 5).map((f, i) => (
-                          <span key={i} className="text-xs bg-slate-800 text-slate-300 px-2 py-1 rounded-md">
-                            {f.name}
-                          </span>
-                        ))}
-                        {files.length > 5 && (
-                          <span className="text-xs bg-slate-800 text-slate-300 px-2 py-1 rounded-md">
-                            +{files.length - 5} أخرى
-                          </span>
-                        )}
-                      </div>
+                  ) : (
+                    <div className="text-center p-6">
+                      <Smartphone className="w-12 h-12 text-slate-700 mx-auto mb-3" />
+                      <p className="text-slate-500 text-sm">اكتب الكود أو اطلب من الذكاء الاصطناعي توليده لرؤية المعاينة هنا.</p>
                     </div>
                   )}
+                </div>
+              </div>
+
+              {/* Build Button & Status */}
+              <div className="bg-slate-900/80 backdrop-blur-md border border-slate-800 rounded-3xl p-6 shadow-xl relative overflow-hidden">
+                {buildState === 'compiling' && (
+                  <div className="absolute inset-0 bg-cyan-500/5 animate-pulse"></div>
+                )}
+                
+                {buildState === 'idle' || buildState === 'error' ? (
+                  <button
+                    onClick={startBuild}
+                    disabled={!code.trim()}
+                    className="w-full bg-gradient-to-r from-cyan-600 to-blue-600 hover:from-cyan-500 hover:to-blue-500 text-white font-bold py-4 rounded-2xl transition-all flex items-center justify-center gap-3 shadow-[0_0_20px_rgba(6,182,212,0.3)] disabled:opacity-50 disabled:shadow-none relative overflow-hidden group"
+                  >
+                    <div className="absolute inset-0 bg-white/20 translate-y-full group-hover:translate-y-0 transition-transform duration-300 ease-out"></div>
+                    <Rocket className="w-6 h-6 relative z-10 group-hover:-translate-y-1 transition-transform" />
+                    <span className="relative z-10 text-lg">تحويل إلى تطبيق APK</span>
+                  </button>
+                ) : buildState === 'success' ? (
+                  <div className="text-center">
+                    <div className="w-16 h-16 bg-emerald-500/20 rounded-full flex items-center justify-center mx-auto mb-3">
+                      <CheckCircle className="w-8 h-8 text-emerald-400" />
+                    </div>
+                    <h4 className="text-lg font-bold text-white mb-4">التطبيق جاهز!</h4>
+                    {artifactId ? (
+                      <a href={`/api/download/${artifactId}`} className="w-full bg-emerald-500 hover:bg-emerald-400 text-slate-900 font-bold py-3 rounded-xl flex items-center justify-center gap-2 shadow-[0_0_15px_rgba(16,185,129,0.4)] mb-3 transition-all">
+                        <Download className="w-5 h-5" /> تحميل APK
+                      </a>
+                    ) : (
+                      <button className="w-full bg-emerald-500 hover:bg-emerald-400 text-slate-900 font-bold py-3 rounded-xl flex items-center justify-center gap-2 shadow-[0_0_15px_rgba(16,185,129,0.4)] mb-3 transition-all">
+                        <Download className="w-5 h-5" /> تحميل APK (محاكاة)
+                      </button>
+                    )}
+                    <button onClick={restartApp} className="text-slate-400 hover:text-white text-sm underline">بناء تطبيق جديد</button>
+                  </div>
+                ) : (
+                  <div className="space-y-4">
+                    <div className="flex justify-between items-center">
+                      <span className="text-cyan-400 font-bold text-sm flex items-center gap-2">
+                        {buildState === 'analyzing' ? <Sparkles className="w-4 h-4 animate-pulse" /> : <Settings className="w-4 h-4 animate-spin" />}
+                        {buildState === 'analyzing' ? 'تحليل الكود...' : 'جاري بناء التطبيق...'}
+                      </span>
+                      <span className="text-white font-mono">{buildProgress}%</span>
+                    </div>
+                    <div className="w-full h-3 bg-slate-800 rounded-full overflow-hidden border border-slate-700">
+                      <motion.div
+                        className="h-full bg-gradient-to-r from-cyan-500 to-blue-500 relative"
+                        initial={{ width: 0 }}
+                        animate={{ width: `${buildProgress}%` }}
+                        transition={{ duration: 0.5 }}
+                      >
+                        <div className="absolute inset-0 bg-white/20 w-full animate-[shimmer_1s_infinite] -skew-x-12"></div>
+                      </motion.div>
+                    </div>
+                    <button onClick={stopBuild} className="w-full py-2 text-red-400 hover:bg-red-500/10 rounded-lg text-sm font-medium transition-colors">
+                      إلغاء العملية
+                    </button>
+                  </div>
+                )}
+
+                {/* Error Message */}
+                {errorMessage && (
+                  <div className="mt-4 p-3 bg-red-500/10 border border-red-500/30 rounded-xl text-red-400 text-sm flex items-start gap-2">
+                    <AlertCircle className="w-5 h-5 shrink-0" />
+                    <p>{errorMessage}</p>
+                  </div>
+                )}
+              </div>
+
+            </div>
+          </div>
+        )}
+      </main>
+
+      {/* Floating Chat Button */}
+      <button
+        onClick={() => setIsChatOpen(true)}
+        className="fixed bottom-6 left-6 w-16 h-16 bg-gradient-to-r from-cyan-500 to-blue-600 rounded-full flex items-center justify-center shadow-[0_0_20px_rgba(6,182,212,0.5)] hover:scale-110 transition-transform z-50"
+      >
+        <Sparkles className="w-8 h-8 text-white" />
+      </button>
+
+      {/* Chat Window */}
+      <AnimatePresence>
+        {isChatOpen && (
+          <motion.div
+            initial={{ opacity: 0, y: 50, scale: 0.9 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: 50, scale: 0.9 }}
+            style={{ '--chat-accent': accentColor } as React.CSSProperties}
+            className={`fixed bottom-24 left-6 w-[350px] sm:w-[450px] h-[600px] ${theme === 'dark' ? 'bg-slate-900/95 border-slate-700' : 'bg-white/95 border-slate-200'} backdrop-blur-xl border rounded-3xl shadow-2xl z-50 flex flex-col overflow-hidden`}
+          >
+            {/* Header */}
+            <div className={`p-4 ${theme === 'dark' ? 'bg-slate-800/50' : 'bg-slate-100/50'} border-b ${theme === 'dark' ? 'border-slate-700' : 'border-slate-200'} flex justify-between items-center`}>
+              <div className="flex items-center gap-3">
+                <div className="w-12 h-12 rounded-full flex items-center justify-center text-2xl shadow-lg" style={{ backgroundColor: accentColor }}>
+                  {avatarEmotion === 'SMILE' ? '😊' : avatarEmotion === 'LAUGH' ? '😂' : avatarEmotion === 'THINK' ? '🤔' : '🤖'}
+                </div>
+                <div>
+                  <h3 className={`font-bold ${theme === 'dark' ? 'text-white' : 'text-slate-900'}`}>كعبول</h3>
+                  <p className="text-xs" style={{ color: accentColor }}>متصل الآن</p>
+                </div>
+              </div>
+              <div className="flex items-center gap-1 sm:gap-2">
+                {user ? (
+                  <button onClick={logout} title="تسجيل الخروج" className={`p-2 rounded-full hover:bg-slate-500/20 ${theme === 'dark' ? 'text-slate-400' : 'text-slate-500'}`}>
+                    <LogOut className="w-4 h-4 sm:w-5 sm:h-5" />
+                  </button>
+                ) : (
+                  <button onClick={() => setShowAuthModal(true)} title="تسجيل الدخول" className={`p-2 rounded-full hover:bg-slate-500/20 ${theme === 'dark' ? 'text-slate-400' : 'text-slate-500'}`}>
+                    <LogIn className="w-4 h-4 sm:w-5 sm:h-5" />
+                  </button>
+                )}
+                <button onClick={handleNewChat} title="محادثة جديدة" className={`p-2 rounded-full hover:bg-slate-500/20 ${theme === 'dark' ? 'text-slate-400' : 'text-slate-500'}`}>
+                  <PlusCircle className="w-4 h-4 sm:w-5 sm:h-5" />
+                </button>
+                <button onClick={handleSaveChat} title="حفظ المحادثة" className={`p-2 rounded-full hover:bg-slate-500/20 ${theme === 'dark' ? 'text-slate-400' : 'text-slate-500'}`}>
+                  <Save className="w-4 h-4 sm:w-5 sm:h-5" />
+                </button>
+                <button onClick={() => {
+                  if (!user) {
+                    setShowAuthModal(true);
+                  } else {
+                    setShowArchive(!showArchive);
+                  }
+                }} title="الأرشيف" className={`p-2 rounded-full hover:bg-slate-500/20 ${showArchive ? 'bg-slate-500/30 text-cyan-500' : theme === 'dark' ? 'text-slate-400' : 'text-slate-500'}`}>
+                  <Archive className="w-4 h-4 sm:w-5 sm:h-5" />
+                </button>
+                <button onClick={() => setShowSettings(!showSettings)} title="الإعدادات" className={`p-2 rounded-full hover:bg-slate-500/20 ${showSettings ? 'bg-slate-500/30 text-cyan-500' : theme === 'dark' ? 'text-slate-400' : 'text-slate-500'}`}>
+                  <Settings className="w-4 h-4 sm:w-5 sm:h-5" />
+                </button>
+                <button onClick={() => setIsChatOpen(false)} className={`p-2 rounded-full hover:bg-slate-500/20 ${theme === 'dark' ? 'text-slate-400' : 'text-slate-500'}`}>
+                  <X className="w-4 h-4 sm:w-5 sm:h-5" />
+                </button>
+              </div>
+            </div>
+
+            {/* Settings Panel */}
+            <AnimatePresence>
+              {showSettings && (
+                <motion.div initial={{ height: 0 }} animate={{ height: 'auto' }} exit={{ height: 0 }} className={`overflow-hidden border-b ${theme === 'dark' ? 'border-slate-700 bg-slate-800' : 'border-slate-200 bg-slate-50'}`}>
+                  <div className="p-4 flex flex-col gap-4">
+                    <div className="flex justify-between items-center">
+                      <span className={`text-sm font-medium ${theme === 'dark' ? 'text-slate-300' : 'text-slate-700'}`}>المظهر</span>
+                      <div className="flex gap-2">
+                        <button onClick={() => setTheme('light')} className={`p-2 rounded-lg ${theme === 'light' ? 'bg-slate-200' : 'hover:bg-slate-700'}`}><Sun className="w-4 h-4 text-amber-500" /></button>
+                        <button onClick={() => setTheme('dark')} className={`p-2 rounded-lg ${theme === 'dark' ? 'bg-slate-700' : 'hover:bg-slate-200'}`}><Moon className="w-4 h-4 text-blue-400" /></button>
+                      </div>
+                    </div>
+                    <div className="flex justify-between items-center">
+                      <span className={`text-sm font-medium ${theme === 'dark' ? 'text-slate-300' : 'text-slate-700'}`}>اللون المميز</span>
+                      <div className="flex gap-2">
+                        {['#06b6d4', '#8b5cf6', '#10b981', '#f43f5e'].map(color => (
+                          <button key={color} onClick={() => setAccentColor(color)} className="w-6 h-6 rounded-full border-2 border-transparent focus:border-white" style={{ backgroundColor: color }} />
+                        ))}
+                      </div>
+                    </div>
+                    
+                    {/* Developer Settings */}
+                    <div className={`pt-3 border-t ${theme === 'dark' ? 'border-slate-700' : 'border-slate-200'} flex flex-col gap-3`}>
+                      <span className={`text-sm font-bold ${theme === 'dark' ? 'text-cyan-400' : 'text-cyan-600'}`}>إعدادات المطور (التحكم بكعبول)</span>
+                      
+                      <div className="flex flex-col gap-1">
+                        <label className={`text-xs ${theme === 'dark' ? 'text-slate-400' : 'text-slate-500'}`}>مستوى الإبداع (Temperature: 0.0 - 2.0)</label>
+                        <input 
+                          type="number" 
+                          step="0.1" 
+                          min="0" 
+                          max="2" 
+                          value={temperature} 
+                          onChange={e => setTemperature(parseFloat(e.target.value) || 0)} 
+                          className={`w-full rounded-lg px-3 py-1.5 text-sm focus:outline-none transition-colors ${theme === 'dark' ? 'bg-slate-900 border-slate-700 text-white focus:border-cyan-500' : 'bg-white border-slate-300 text-slate-900 focus:border-cyan-500'} border`}
+                        />
+                      </div>
+
+                      <div className="flex flex-col gap-1">
+                        <label className={`text-xs ${theme === 'dark' ? 'text-slate-400' : 'text-slate-500'}`}>شخصية كعبول (System Prompt)</label>
+                        <textarea 
+                          value={systemPrompt} 
+                          onChange={e => setSystemPrompt(e.target.value)} 
+                          rows={3}
+                          className={`w-full rounded-lg px-3 py-2 text-sm focus:outline-none transition-colors resize-none ${theme === 'dark' ? 'bg-slate-900 border-slate-700 text-white focus:border-cyan-500' : 'bg-white border-slate-300 text-slate-900 focus:border-cyan-500'} border`}
+                        />
+                      </div>
+                    </div>
+                  </div>
                 </motion.div>
               )}
             </AnimatePresence>
 
-            {/* Action Button */}
-            <div className="mt-8">
-              <button
-                onClick={startBuild}
-                disabled={buildState === 'analyzing' || buildState === 'compiling' || (activeTab === 'code' && !code) || (activeTab === 'upload' && files.length === 0)}
-                className="w-full bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-800 disabled:text-slate-500 text-white font-medium py-4 rounded-xl transition-all flex items-center justify-center gap-2 shadow-lg shadow-indigo-500/20 disabled:shadow-none"
-              >
-                {buildState === 'idle' || buildState === 'error' || buildState === 'success' ? (
-                  <>
-                    <Cpu className="w-5 h-5" />
-                    ابدأ بناء الـ APK
-                  </>
+            {/* Messages or Archive */}
+            {showArchive ? (
+              <div className={`flex-1 overflow-y-auto p-4 space-y-2 ${theme === 'dark' ? 'bg-slate-900/50' : 'bg-slate-50'}`}>
+                <h4 className={`font-bold mb-4 ${theme === 'dark' ? 'text-white' : 'text-slate-800'}`}>أرشيف المحادثات</h4>
+                {chatSessions.length === 0 ? (
+                  <div className="text-center text-slate-500 mt-10 text-sm">لا توجد محادثات محفوظة حالياً.</div>
                 ) : (
-                  <>
-                    <Loader2 className="w-5 h-5 animate-spin" />
-                    جاري المعالجة...
-                  </>
+                  chatSessions.map(session => (
+                    <div key={session.id} className={`p-3 rounded-xl border flex justify-between items-center group cursor-pointer transition-colors ${theme === 'dark' ? 'bg-slate-800 border-slate-700 hover:border-cyan-500' : 'bg-white border-slate-200 hover:border-cyan-500'}`} onClick={() => handleLoadChat(session)}>
+                      <div className="flex flex-col overflow-hidden">
+                        <span className={`font-medium text-sm truncate ${theme === 'dark' ? 'text-slate-200' : 'text-slate-800'}`}>{session.title}</span>
+                        <span className="text-xs text-slate-500">{session.date}</span>
+                      </div>
+                      <button onClick={(e) => { e.stopPropagation(); handleDeleteChat(session.id); }} className="p-2 text-slate-500 hover:text-red-500 opacity-0 group-hover:opacity-100 transition-opacity">
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    </div>
+                  ))
                 )}
-              </button>
-            </div>
-          </div>
-        </div>
+              </div>
+            ) : (
+              <div className={`flex-1 overflow-y-auto p-4 space-y-4 ${theme === 'dark' ? 'text-slate-200' : 'text-slate-800'}`}>
+                {chatMessages.map((msg, idx) => (
+                <div key={idx} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                  <div className={`max-w-[85%] p-3 rounded-2xl ${msg.role === 'user' ? 'text-white rounded-bl-none' : `${theme === 'dark' ? 'bg-slate-800 border-slate-700' : 'bg-slate-100 border-slate-200'} border rounded-br-none`}`} style={msg.role === 'user' ? { backgroundColor: accentColor } : {}}>
+                    
+                    {/* Attachments */}
+                    {msg.attachments && msg.attachments.length > 0 && (
+                      <div className="flex flex-wrap gap-2 mb-2">
+                        {msg.attachments.map((att, i) => (
+                          att.mimeType.startsWith('image/') ? 
+                            <img key={i} src={`data:${att.mimeType};base64,${att.data}`} alt="attachment" className="w-20 h-20 object-cover rounded-lg border border-white/20" /> :
+                            <div key={i} className="flex items-center gap-1 bg-black/20 px-2 py-1 rounded text-xs"><FileArchive className="w-3 h-3"/> {att.name}</div>
+                        ))}
+                      </div>
+                    )}
 
-        {/* Build Status Section */}
-        <AnimatePresence>
-          {buildState !== 'idle' && (
-            <motion.div
-              initial={{ opacity: 0, height: 0, marginTop: 0 }}
-              animate={{ opacity: 1, height: 'auto', marginTop: 32 }}
-              className="bg-slate-900 border border-slate-800 rounded-3xl p-6 overflow-hidden"
-            >
-              <h3 className="text-lg font-semibold text-white mb-6 flex items-center gap-2">
-                <Cpu className="w-5 h-5 text-indigo-400" />
-                محطة بناء كعبول
-              </h3>
+                    {/* Text with Markdown */}
+                    <div className="text-sm whitespace-pre-wrap leading-relaxed prose prose-invert max-w-none">
+                      <ReactMarkdown
+                        components={{
+                          pre: ({ children }) => <div className="not-prose">{children}</div>,
+                          code({node, className, children, ...props}: any) {
+                            const match = /language-(\w+)/.exec(className || '')
+                            const codeString = String(children).replace(/\n$/, '')
+                            if (match) {
+                              return (
+                                <div className="relative group mt-2 mb-2">
+                                  <div className="absolute left-2 top-2 flex gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
+                                    <button onClick={() => setSandboxCode({code: codeString, type: match[1]})} className="bg-slate-700 hover:bg-slate-600 text-xs px-2 py-1 rounded text-white flex items-center gap-1">
+                                      <PlayIcon className="w-3 h-3" /> تشغيل
+                                    </button>
+                                  </div>
+                                  <pre className="bg-slate-950 p-3 pt-8 rounded-xl overflow-x-auto text-xs font-mono text-cyan-100" dir="ltr">
+                                    <code className={className} {...props}>{children}</code>
+                                  </pre>
+                                </div>
+                              )
+                            }
+                            return (
+                              <code className="bg-slate-900 px-1 py-0.5 rounded text-cyan-300 text-xs" {...props}>{children}</code>
+                            )
+                          }
+                        }}
+                      >
+                        {msg.text}
+                      </ReactMarkdown>
+                    </div>
 
-              {/* Progress Bar */}
-              <div className="mb-8">
-                <div className="flex justify-between items-center text-sm mb-2">
-                  <span className="text-slate-400">
-                    {buildState === 'analyzing' && 'جاري تحليل الكود بالذكاء الاصطناعي...'}
-                    {buildState === 'compiling' && 'جاري تجميع التطبيق وبناء ملف APK...'}
-                    {buildState === 'success' && 'اكتمل البناء بنجاح!'}
-                    {buildState === 'error' && 'حدث خطأ أثناء البناء.'}
-                  </span>
-                  <div className="flex items-center gap-4">
-                    {(buildState === 'analyzing' || buildState === 'compiling') && (
-                      <button onClick={stopBuild} className="text-red-400 hover:text-red-300 flex items-center gap-1 transition-colors">
-                        <StopCircle className="w-4 h-4" /> إيقاف
+                    {/* Stickers */}
+                    {msg.stickers && msg.stickers.length > 0 && (
+                      <div className="flex gap-2 mt-2">
+                        {msg.stickers.map((st, i) => (
+                          <div key={i} className="text-3xl">
+                            {st === 'thumbs_up' ? '👍' : st === 'rocket' ? '🚀' : st === 'heart' ? '❤️' : '✨'}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+
+                    {/* TTS Button for model messages */}
+                    {msg.role === 'model' && (
+                      <button onClick={() => speakText(msg.text)} className="mt-2 text-slate-400 hover:text-slate-200">
+                        <Volume2 className="w-4 h-4" />
                       </button>
                     )}
-                    <span className="text-indigo-400 font-mono">{buildProgress}%</span>
                   </div>
                 </div>
-                <div className="w-full h-2 bg-slate-800 rounded-full overflow-hidden">
-                  <motion.div
-                    className={`h-full ${buildState === 'error' ? 'bg-red-500' : 'bg-indigo-500'}`}
-                    initial={{ width: 0 }}
-                    animate={{ width: `${buildProgress}%` }}
-                    transition={{ duration: 0.5 }}
-                  />
+              ))}
+              
+              {isChatLoading && (
+                <div className="flex justify-start">
+                  <div className={`${theme === 'dark' ? 'bg-slate-800 border-slate-700' : 'bg-slate-100 border-slate-200'} border p-4 rounded-2xl rounded-br-none flex gap-2 items-center`}>
+                    <div className="w-2 h-2 rounded-full animate-bounce" style={{ backgroundColor: accentColor }}></div>
+                    <div className="w-2 h-2 rounded-full animate-bounce" style={{ backgroundColor: accentColor, animationDelay: '0.2s' }}></div>
+                    <div className="w-2 h-2 rounded-full animate-bounce" style={{ backgroundColor: accentColor, animationDelay: '0.4s' }}></div>
+                  </div>
                 </div>
+              )}
+              <div ref={chatEndRef} />
+            </div>
+            )}
+
+            {/* Auth Modal Overlay */}
+            <AnimatePresence>
+              {showAuthModal && (
+                <motion.div 
+                  initial={{ opacity: 0 }} 
+                  animate={{ opacity: 1 }} 
+                  exit={{ opacity: 0 }} 
+                  className="absolute inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4"
+                >
+                  <div className={`w-full max-w-sm rounded-2xl p-6 flex flex-col gap-4 shadow-2xl ${theme === 'dark' ? 'bg-slate-800 text-white' : 'bg-white text-slate-900'}`}>
+                    <div className="flex justify-between items-center mb-2">
+                      <h3 className="font-bold text-lg">تسجيل الدخول</h3>
+                      <button onClick={() => setShowAuthModal(false)} className="p-1 rounded-full hover:bg-slate-500/20">
+                        <X className="w-5 h-5" />
+                      </button>
+                    </div>
+                    <p className={`text-sm mb-4 ${theme === 'dark' ? 'text-slate-300' : 'text-slate-600'}`}>
+                      سجل دخولك لحفظ محادثاتك وإعداداتك في السحابة والوصول إليها من أي مكان.
+                    </p>
+                    <button 
+                      onClick={async () => {
+                        try {
+                          await loginWithGoogle();
+                          setShowAuthModal(false);
+                        } catch (e) {
+                          console.error(e);
+                        }
+                      }}
+                      className="w-full py-3 px-4 bg-white text-slate-800 font-medium rounded-xl border border-slate-200 shadow-sm hover:bg-slate-50 flex items-center justify-center gap-3 transition-colors"
+                    >
+                      <svg className="w-5 h-5" viewBox="0 0 24 24">
+                        <path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" fill="#4285F4"/>
+                        <path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853"/>
+                        <path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" fill="#FBBC05"/>
+                        <path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335"/>
+                      </svg>
+                      المتابعة باستخدام Google
+                    </button>
+                    <div className="relative flex items-center py-2">
+                      <div className="flex-grow border-t border-slate-300/30"></div>
+                      <span className={`flex-shrink-0 mx-4 text-xs ${theme === 'dark' ? 'text-slate-400' : 'text-slate-500'}`}>أو</span>
+                      <div className="flex-grow border-t border-slate-300/30"></div>
+                    </div>
+                    <button 
+                      onClick={async () => {
+                        try {
+                          await loginAnonymously();
+                          setShowAuthModal(false);
+                        } catch (e) {
+                          console.error(e);
+                        }
+                      }}
+                      className={`w-full py-3 px-4 font-medium rounded-xl flex items-center justify-center gap-3 transition-colors ${theme === 'dark' ? 'bg-slate-700 hover:bg-slate-600 text-white' : 'bg-slate-100 hover:bg-slate-200 text-slate-800'}`}
+                    >
+                      <User className="w-5 h-5" />
+                      الدخول كزائر
+                    </button>
+                  </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
+
+            {/* Code Sandbox Overlay */}
+            <AnimatePresence>
+              {sandboxCode && (
+                <motion.div initial={{ y: '100%' }} animate={{ y: 0 }} exit={{ y: '100%' }} className={`absolute inset-x-0 bottom-0 h-2/3 ${theme === 'dark' ? 'bg-slate-900 border-slate-700' : 'bg-white border-slate-200'} border-t shadow-2xl flex flex-col z-20`}>
+                  <div className={`p-2 flex justify-between items-center border-b ${theme === 'dark' ? 'border-slate-800 bg-slate-800/50' : 'border-slate-200 bg-slate-100'}`}>
+                    <span className={`text-xs font-bold ${theme === 'dark' ? 'text-slate-300' : 'text-slate-700'}`}>نتيجة التشغيل ({sandboxCode.type})</span>
+                    <button onClick={() => setSandboxCode(null)} className="text-slate-400 hover:text-red-400"><X className="w-4 h-4" /></button>
+                  </div>
+                  <div className="flex-1 bg-white">
+                    {sandboxCode.type === 'html' || sandboxCode.type === 'xml' ? (
+                      <iframe srcDoc={sandboxCode.code} className="w-full h-full border-0" sandbox="allow-scripts" />
+                    ) : (
+                      <div className="p-4 text-sm text-slate-800 font-mono whitespace-pre-wrap" dir="ltr">
+                        {/* Simple eval for JS, otherwise just show code */}
+                        {sandboxCode.type === 'javascript' || sandboxCode.type === 'js' ? 
+                          (() => { try { return String(eval(sandboxCode.code)); } catch(e:any) { return e.toString(); } })() 
+                          : 'لا يمكن تشغيل هذا النوع من الكود مباشرة هنا.'}
+                      </div>
+                    )}
+                  </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
+
+            {/* Input Area */}
+            <div className={`p-3 ${theme === 'dark' ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'} border-t flex flex-col gap-2 z-10`}>
+              {attachments.length > 0 && (
+                <div className="flex gap-2 overflow-x-auto pb-2">
+                  {attachments.map((att, i) => (
+                    <div key={i} className="relative w-12 h-12 rounded bg-slate-800 border border-slate-700 flex-shrink-0">
+                      {att.mimeType.startsWith('image/') ? 
+                        <img src={`data:${att.mimeType};base64,${att.data}`} className="w-full h-full object-cover rounded" /> :
+                        <div className="w-full h-full flex items-center justify-center"><FileArchive className="w-5 h-5 text-slate-400"/></div>
+                      }
+                      <button onClick={() => setAttachments(prev => prev.filter((_, idx) => idx !== i))} className="absolute -top-1 -right-1 bg-red-500 text-white rounded-full p-0.5"><X className="w-3 h-3"/></button>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <div className="flex gap-2 items-center">
+                <input type="file" id="chat-file-upload" className="hidden" multiple accept="image/*,.pdf,.txt,.zip" onChange={handleChatFileUpload} />
+                <label htmlFor="chat-file-upload" className={`p-2 rounded-xl cursor-pointer transition-colors ${theme === 'dark' ? 'text-slate-400 hover:bg-slate-800' : 'text-slate-500 hover:bg-slate-100'}`}>
+                  <Paperclip className="w-5 h-5" />
+                </label>
+                
+                <button onClick={startRecording} className={`p-2 rounded-xl transition-colors ${isRecording ? 'text-red-500 bg-red-500/10 animate-pulse' : theme === 'dark' ? 'text-slate-400 hover:bg-slate-800' : 'text-slate-500 hover:bg-slate-100'}`}>
+                  <Mic className="w-5 h-5" />
+                </button>
+
+                <input
+                  type="text"
+                  value={chatInput}
+                  onChange={(e) => setChatInput(e.target.value)}
+                  onKeyPress={(e) => e.key === 'Enter' && handleSendMessage()}
+                  placeholder="اكتب رسالتك هنا..."
+                  className={`flex-1 rounded-xl px-4 py-2 text-sm focus:outline-none transition-colors ${theme === 'dark' ? 'bg-slate-800 border-slate-700 text-white focus:border-cyan-500' : 'bg-slate-100 border-slate-200 text-slate-900 focus:border-cyan-500'} border`}
+                />
+                <button
+                  onClick={handleSendMessage}
+                  disabled={isChatLoading || (!chatInput.trim() && attachments.length === 0)}
+                  className="text-white p-2.5 rounded-xl disabled:opacity-50 transition-colors flex items-center justify-center"
+                  style={{ backgroundColor: accentColor }}
+                >
+                  <Send className="w-5 h-5" />
+                </button>
               </div>
-
-              {/* AI Report */}
-              {aiReport && (
-                <motion.div
-                  initial={{ opacity: 0 }}
-                  animate={{ opacity: 1 }}
-                  className="mb-8 bg-slate-950 rounded-xl p-4 border border-slate-800/50"
-                >
-                  <div className="flex items-start gap-3">
-                    <div className="mt-1">
-                      <CheckCircle className="w-5 h-5 text-emerald-400" />
-                    </div>
-                    <div>
-                      <h4 className="text-sm font-medium text-slate-200 mb-1">تقرير كعبول الذكي:</h4>
-                      <p className="text-sm text-slate-400 leading-relaxed">{aiReport}</p>
-                    </div>
-                  </div>
-                </motion.div>
-              )}
-
-              {/* Result Actions */}
-              {buildState === 'success' && (
-                <motion.div
-                  initial={{ opacity: 0, y: 10 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  className="flex flex-col items-center justify-center py-6 border-2 border-dashed border-emerald-500/20 bg-emerald-500/5 rounded-2xl"
-                >
-                  <div className="w-16 h-16 bg-emerald-500/20 rounded-full flex items-center justify-center mb-4">
-                    <CheckCircle className="w-8 h-8 text-emerald-400" />
-                  </div>
-                  <h4 className="text-xl font-bold text-white mb-2">تطبيقك جاهز!</h4>
-                  <p className="text-slate-400 text-sm mb-6 text-center max-w-md">
-                    تم بناء ملف الـ APK بنجاح وهو جاهز للتحميل والتثبيت على هاتفك الأندرويد.
-                  </p>
-                  <button
-                    onClick={downloadDummyAPK}
-                    className="bg-emerald-500 hover:bg-emerald-600 text-white px-8 py-3 rounded-xl font-medium flex items-center gap-2 transition-colors shadow-lg shadow-emerald-500/20 mb-6"
-                  >
-                    <Download className="w-5 h-5" />
-                    تحميل ملف APK
-                  </button>
-                  <div className="flex gap-3">
-                    <button onClick={deleteTask} className="bg-slate-800 hover:bg-slate-700 text-slate-300 px-4 py-2 rounded-xl text-sm font-medium flex items-center gap-2 transition-colors">
-                      <Trash2 className="w-4 h-4" /> حذف المهمة
-                    </button>
-                    <button onClick={restartApp} className="bg-slate-800 hover:bg-slate-700 text-slate-300 px-4 py-2 rounded-xl text-sm font-medium flex items-center gap-2 transition-colors">
-                      <RefreshCw className="w-4 h-4" /> إعادة تشغيل
-                    </button>
-                  </div>
-                </motion.div>
-              )}
-
-              {buildState === 'error' && (
-                <motion.div
-                  initial={{ opacity: 0, y: 10 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  className="flex flex-col items-center justify-center py-6 border-2 border-dashed border-red-500/20 bg-red-500/5 rounded-2xl"
-                >
-                  <div className="w-16 h-16 bg-red-500/20 rounded-full flex items-center justify-center mb-4">
-                    <AlertCircle className="w-8 h-8 text-red-400" />
-                  </div>
-                  <h4 className="text-xl font-bold text-white mb-2">فشل البناء</h4>
-                  <p className="text-slate-400 text-sm text-center max-w-md mb-4">
-                    عذراً، حدث خطأ أثناء محاولة بناء التطبيق. يرجى التحقق من الكود والمحاولة مرة أخرى.
-                  </p>
-                  {errorMessage && (
-                    <div className="bg-red-950/50 border border-red-900/50 rounded-lg p-3 w-full max-w-md text-left mb-6" dir="ltr">
-                      <p className="text-xs text-red-400 font-mono break-words">
-                        Error: {errorMessage}
-                      </p>
-                    </div>
-                  )}
-                  <div className="flex gap-3">
-                    <button onClick={deleteTask} className="bg-slate-800 hover:bg-slate-700 text-slate-300 px-4 py-2 rounded-xl text-sm font-medium flex items-center gap-2 transition-colors">
-                      <Trash2 className="w-4 h-4" /> حذف المهمة
-                    </button>
-                    <button onClick={restartApp} className="bg-slate-800 hover:bg-slate-700 text-slate-300 px-4 py-2 rounded-xl text-sm font-medium flex items-center gap-2 transition-colors">
-                      <RefreshCw className="w-4 h-4" /> إعادة تشغيل
-                    </button>
-                  </div>
-                </motion.div>
-              )}
-
-            </motion.div>
-          )}
-        </AnimatePresence>
-      </main>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }

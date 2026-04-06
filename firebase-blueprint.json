@@ -1,0 +1,82 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "User profile and settings",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "User ID"
+        },
+        "theme": {
+          "type": "string",
+          "enum": ["dark", "light"],
+          "description": "User's preferred theme"
+        },
+        "accentColor": {
+          "type": "string",
+          "description": "User's preferred accent color"
+        },
+        "systemPrompt": {
+          "type": "string",
+          "description": "User's custom system prompt for Kabboul"
+        },
+        "temperature": {
+          "type": "number",
+          "description": "User's preferred temperature for Kabboul"
+        },
+        "createdAt": {
+          "type": "timestamp",
+          "description": "Account creation timestamp"
+        }
+      },
+      "required": ["uid", "createdAt"]
+    },
+    "ChatSession": {
+      "title": "ChatSession",
+      "description": "A chat session with Kabboul",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Session ID"
+        },
+        "userId": {
+          "type": "string",
+          "description": "Owner User ID"
+        },
+        "title": {
+          "type": "string",
+          "description": "Chat title"
+        },
+        "date": {
+          "type": "string",
+          "description": "Formatted date string"
+        },
+        "messages": {
+          "type": "array",
+          "description": "Serialized chat messages (JSON stringified to avoid complex nested arrays/objects limits if needed, or just array of objects)",
+          "items": {
+            "type": "object"
+          }
+        },
+        "createdAt": {
+          "type": "timestamp",
+          "description": "Session creation timestamp"
+        }
+      },
+      "required": ["id", "userId", "title", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "UserProfile",
+      "description": "User profiles and settings"
+    },
+    "/chatSessions/{sessionId}": {
+      "schema": "ChatSession",
+      "description": "Chat sessions belonging to users"
+    }
+  }
+}

@@ -1,0 +1,109 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // ===============================================================
+    // Assumed Data Model
+    // ===============================================================
+    //
+    // Collection: users
+    // Document ID: {userId}
+    // Fields:
+    //   - uid: string (required, immutable) - User ID
+    //   - theme: string (optional) - User's preferred theme
+    //   - accentColor: string (optional) - User's preferred accent color
+    //   - systemPrompt: string (optional) - User's custom system prompt for Kabboul
+    //   - temperature: number (optional) - User's preferred temperature for Kabboul
+    //   - createdAt: timestamp (required, immutable) - Account creation timestamp
+    //
+    // Collection: chatSessions
+    // Document ID: {sessionId}
+    // Fields:
+    //   - id: string (required, immutable) - Session ID
+    //   - userId: string (required, immutable) - Owner User ID
+    //   - title: string (required) - Chat title
+    //   - date: string (optional) - Formatted date string
+    //   - messages: list (optional) - Chat messages
+    //   - createdAt: timestamp (required, immutable) - Session creation timestamp
+    //
+    // ===============================================================
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isDocOwner() {
+      return isAuthenticated() && request.auth.uid == resource.data.userId;
+    }
+
+    function uidUnchanged() {
+      return !('uid' in request.resource.data) || request.resource.data.uid == request.auth.uid;
+    }
+
+    function uidNotModified() {
+      return !('uid' in request.resource.data) || request.resource.data.uid == resource.data.uid;
+    }
+
+    function userIdUnchanged() {
+      return !('userId' in request.resource.data) || request.resource.data.userId == request.auth.uid;
+    }
+
+    function userIdNotModified() {
+      return !('userId' in request.resource.data) || request.resource.data.userId == resource.data.userId;
+    }
+
+    function hasRequiredFields(fields) {
+      return request.resource.data.keys().hasAll(fields);
+    }
+
+    function hasOnlyAllowedFields(fields) {
+      return request.resource.data.keys().hasOnly(fields);
+    }
+
+    function areImmutableFieldsUnchanged(fields) {
+      return !request.resource.data.diff(resource.data).affectedKeys().hasAny(fields);
+    }
+
+    // Domain Validators
+    function isValidUser(data) {
+      return hasOnlyAllowedFields(['uid', 'theme', 'accentColor', 'systemPrompt', 'temperature', 'createdAt']) &&
+             data.uid is string && data.uid.size() > 0 && data.uid.size() < 100 &&
+             (!('theme' in data) || (data.theme in ['dark', 'light'])) &&
+             (!('accentColor' in data) || (data.accentColor is string && data.accentColor.size() < 20)) &&
+             (!('systemPrompt' in data) || (data.systemPrompt is string && data.systemPrompt.size() < 5000)) &&
+             (!('temperature' in data) || (data.temperature is number && data.temperature >= 0 && data.temperature <= 2)) &&
+             data.createdAt is timestamp;
+    }
+
+    function isValidChatSession(data) {
+      return hasOnlyAllowedFields(['id', 'userId', 'title', 'date', 'messages', 'createdAt']) &&
+             data.id is string && data.id.size() > 0 && data.id.size() < 100 &&
+             data.userId is string && data.userId.size() > 0 && data.userId.size() < 100 &&
+             data.title is string && data.title.size() < 200 &&
+             (!('date' in data) || (data.date is string && data.date.size() < 100)) &&
+             (!('messages' in data) || (data.messages is list && data.messages.size() < 1000)) &&
+             data.createdAt is timestamp;
+    }
+
+    match /users/{userId} {
+      allow read: if isOwner(userId);
+      allow create: if isOwner(userId) && hasRequiredFields(['uid', 'createdAt']) && isValidUser(request.resource.data) && uidUnchanged();
+      allow update: if isOwner(userId) && isValidUser(request.resource.data) && uidNotModified() && areImmutableFieldsUnchanged(['createdAt']);
+      allow delete: if isOwner(userId);
+    }
+
+    match /chatSessions/{sessionId} {
+      // Allow read if the user is the owner, or allow list queries where userId == request.auth.uid
+      allow read: if isDocOwner() || (isAuthenticated() && request.auth.uid == resource.data.userId);
+      allow create: if isAuthenticated() && hasRequiredFields(['id', 'userId', 'title', 'createdAt']) && isValidChatSession(request.resource.data) && userIdUnchanged();
+      allow update: if isDocOwner() && isValidChatSession(request.resource.data) && userIdNotModified() && areImmutableFieldsUnchanged(['id', 'createdAt']);
+      allow delete: if isDocOwner();
+    }
+  }
+}
