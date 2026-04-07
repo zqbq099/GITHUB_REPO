@@ -5,7 +5,7 @@ import {
   Loader2, Download, Smartphone, StopCircle, Trash2, RefreshCw, 
   Rocket, Settings, Grid, MessageSquare, Play, Sparkles, LayoutTemplate,
   X, Send, Mic, Paperclip, Moon, Sun, Palette, Volume2, Play as PlayIcon,
-  PlusCircle, Save, Archive, History, LogOut, User, LogIn
+  PlusCircle, Save, Archive, History, LogOut, User, LogIn, Github
 } from 'lucide-react';
 import { GoogleGenAI } from '@google/genai';
 import ReactMarkdown from 'react-markdown';
@@ -105,6 +105,8 @@ export default function App() {
   // Inputs
   const [code, setCode] = useState('');
   const [files, setFiles] = useState<File[]>([]);
+  const [githubUrl, setGithubUrl] = useState('');
+  const [isGithubLoading, setIsGithubLoading] = useState(false);
   
   // States
   const [buildState, setBuildState] = useState<BuildState>('idle');
@@ -343,6 +345,9 @@ export default function App() {
           
           const extractedAttachments: {data: string, mimeType: string, name: string}[] = [];
           
+          let totalBase64Size = 0;
+          const MAX_TOTAL_SIZE = 4 * 1024 * 1024; // ~4MB limit for inline data to prevent XHR errors
+
           for (const [relativePath, zipEntry] of Object.entries(loadedZip.files)) {
             if (zipEntry.dir) continue; // Skip directories
             
@@ -350,6 +355,13 @@ export default function App() {
             if (relativePath.includes('__MACOSX') || relativePath.includes('.DS_Store')) continue;
 
             const base64Data = await zipEntry.async('base64');
+            totalBase64Size += base64Data.length;
+            
+            if (totalBase64Size > MAX_TOTAL_SIZE) {
+              alert('حجم الملفات داخل الملف المضغوط كبير جداً. تم إرفاق جزء من الملفات فقط لتجنب أخطاء الاتصال.');
+              break;
+            }
+
             extractedAttachments.push({
               data: base64Data,
               mimeType: getMimeType(relativePath),
@@ -513,11 +525,120 @@ export default function App() {
       
       if (error?.status === 429 || error?.message?.includes('429') || error?.message?.includes('RESOURCE_EXHAUSTED')) {
         errorMessage = 'عذراً، لقد تجاوزت الحد المسموح به للاستخدام (Quota Exceeded). يرجى التحقق من خطة الفوترة الخاصة بك أو المحاولة لاحقاً.';
+      } else if (error?.status === 500 || error?.message?.includes('xhr error') || error?.message?.includes('500')) {
+        errorMessage = 'عذراً، حدث خطأ في الاتصال بالخادم. قد يكون حجم الملفات المرفقة (أو الملفات المستخرجة من ZIP) كبيراً جداً، يرجى المحاولة بملفات أقل حجماً.';
       }
       
       setChatMessages(prev => [...prev, { role: 'model', text: errorMessage }]);
     } finally {
       setIsChatLoading(false);
+    }
+  };
+
+  const handleGithubImport = async () => {
+    if (!githubUrl.trim()) return;
+    
+    // Basic validation for github url
+    const match = githubUrl.match(/github\.com\/([^\/]+)\/([^\/]+)/);
+    if (!match) {
+      alert('الرجاء إدخال رابط GitHub صحيح (مثال: https://github.com/username/repo)');
+      return;
+    }
+    
+    const owner = match[1];
+    const repo = match[2].replace('.git', '');
+    
+    setIsGithubLoading(true);
+    try {
+      // First get the default branch
+      const repoInfoRes = await fetch(`https://api.github.com/repos/${owner}/${repo}`);
+      if (!repoInfoRes.ok) {
+        throw new Error('فشل في جلب معلومات المشروع. تأكد من أن المستودع عام (Public) والرابط صحيح.');
+      }
+      const repoInfo = await repoInfoRes.json();
+      const defaultBranch = repoInfo.default_branch || 'main';
+
+      // Get the repository tree recursively
+      const treeRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/git/trees/${defaultBranch}?recursive=1`);
+      if (!treeRes.ok) {
+        throw new Error('فشل في جلب هيكل المشروع.');
+      }
+      const treeData = await treeRes.json();
+      
+      let mainCodeFile = '';
+      const extractedFiles: File[] = [];
+      let mainCodeFileName = '';
+      
+      // Filter files to fetch
+      const filesToFetch = treeData.tree.filter((item: any) => {
+        if (item.type !== 'blob') return false;
+        const path = item.path;
+        if (
+          path.includes('node_modules/') || 
+          path.includes('.git/') || 
+          path.includes('dist/') || 
+          path.includes('build/') || 
+          path.includes('.DS_Store') ||
+          path.includes('__MACOSX') ||
+          path.includes('package-lock.json') ||
+          path.includes('yarn.lock') ||
+          path.includes('pnpm-lock.yaml')
+        ) {
+          return false;
+        }
+        return true;
+      });
+
+      // Limit to 50 files to avoid browser hanging or rate limits
+      const limitedFiles = filesToFetch.slice(0, 50);
+
+      // Fetch files
+      await Promise.all(limitedFiles.map(async (item: any) => {
+        try {
+          const fileRes = await fetch(`https://raw.githubusercontent.com/${owner}/${repo}/${defaultBranch}/${item.path}`);
+          if (!fileRes.ok) return;
+          
+          const blob = await fileRes.blob();
+          const fileName = item.path.split('/').pop() || item.path;
+          
+          // Try to find the main code file
+          if (!mainCodeFile && (fileName === 'App.tsx' || fileName === 'App.jsx' || fileName === 'main.tsx' || fileName === 'index.html')) {
+            mainCodeFile = await blob.text();
+            mainCodeFileName = fileName;
+          } else {
+            const file = new File([blob], fileName, { type: getMimeType(fileName) });
+            extractedFiles.push(file);
+          }
+        } catch (err) {
+          console.error(`Failed to fetch ${item.path}`, err);
+        }
+      }));
+      
+      if (mainCodeFile) {
+        setCode(mainCodeFile);
+      } else {
+        // Fallback: find the first suitable code file from the extracted files
+        const fallbackIndex = extractedFiles.findIndex(f => 
+          f.name.endsWith('.tsx') || f.name.endsWith('.jsx') || f.name.endsWith('.html') || f.name.endsWith('.js')
+        );
+        
+        if (fallbackIndex !== -1) {
+          const fallbackFile = extractedFiles[fallbackIndex];
+          mainCodeFile = await fallbackFile.text();
+          setCode(mainCodeFile);
+          extractedFiles.splice(fallbackIndex, 1); // Remove it from files list
+        }
+      }
+      
+      setFiles(prev => [...prev, ...extractedFiles]);
+      setGithubUrl('');
+      alert('تم سحب المشروع بنجاح!');
+      
+    } catch (error: any) {
+      console.error('GitHub Import Error:', error);
+      alert(error.message || 'حدث خطأ أثناء سحب المشروع.');
+    } finally {
+      setIsGithubLoading(false);
     }
   };
 
@@ -733,6 +854,31 @@ export default function App() {
                     <input type="file" multiple ref={fileInputRef} onChange={handleFileChange} className="hidden" />
                     <button onClick={() => fileInputRef.current?.click()} className="w-full bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-xl px-4 py-2.5 text-sm text-slate-300 flex items-center justify-center gap-2 transition-all">
                       <UploadCloud className="w-4 h-4" /> {files.length > 0 ? `تم اختيار ${files.length} ملف` : 'اختر ملفات'}
+                    </button>
+                  </div>
+                </div>
+
+                {/* GitHub Import */}
+                <div className="mt-4 pt-4 border-t border-slate-800">
+                  <label className="block text-xs font-medium text-slate-400 mb-1.5 flex items-center gap-2">
+                    <Github className="w-4 h-4" /> استيراد من GitHub
+                  </label>
+                  <div className="flex gap-2">
+                    <input 
+                      type="text" 
+                      value={githubUrl} 
+                      onChange={(e) => setGithubUrl(e.target.value)} 
+                      placeholder="https://github.com/username/repo" 
+                      className="flex-1 bg-[#0a0f1c] border border-slate-700 rounded-xl px-4 py-2.5 text-sm text-white focus:ring-2 focus:ring-cyan-500 outline-none transition-all" 
+                      dir="ltr"
+                    />
+                    <button 
+                      onClick={handleGithubImport}
+                      disabled={isGithubLoading || !githubUrl.trim()}
+                      className="bg-slate-800 hover:bg-slate-700 text-cyan-400 font-bold px-4 rounded-xl flex items-center justify-center gap-2 transition-all disabled:opacity-50"
+                    >
+                      {isGithubLoading ? <Settings className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />}
+                      سحب
                     </button>
                   </div>
                 </div>
