@@ -1,3 +1,11 @@
+مشروع كعبول - الكود المصدري الكامل
+
+
+
+=================================================================
+FILE: src/App.tsx
+=================================================================
+
 import React, { useState, useRef, useEffect } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { 
@@ -1397,4 +1405,341 @@ export default function App() {
       </AnimatePresence>
     </div>
   );
+}
+
+
+=================================================================
+FILE: src/index.css
+=================================================================
+
+@import "tailwindcss";
+
+
+=================================================================
+FILE: src/main.tsx
+=================================================================
+
+import {StrictMode} from 'react';
+import {createRoot} from 'react-dom/client';
+import App from './App.tsx';
+import './index.css';
+
+createRoot(document.getElementById('root')!).render(
+  <StrictMode>
+    <App />
+  </StrictMode>,
+);
+
+
+=================================================================
+FILE: src/firebase.ts
+=================================================================
+
+import { initializeApp } from 'firebase/app';
+import { getAuth, GoogleAuthProvider, signInWithPopup, signInAnonymously, signOut } from 'firebase/auth';
+import { getFirestore } from 'firebase/firestore';
+import firebaseConfig from '../firebase-applet-config.json';
+
+const app = initializeApp(firebaseConfig);
+export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
+export const auth = getAuth(app);
+export const googleProvider = new GoogleAuthProvider();
+
+export const loginWithGoogle = () => signInWithPopup(auth, googleProvider);
+export const loginAnonymously = () => signInAnonymously(auth);
+export const logout = () => signOut(auth);
+
+
+=================================================================
+FILE: firestore.rules
+=================================================================
+
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // ===============================================================
+    // Assumed Data Model
+    // ===============================================================
+    //
+    // Collection: users
+    // Document ID: {userId}
+    // Fields:
+    //   - uid: string (required, immutable) - User ID
+    //   - theme: string (optional) - User's preferred theme
+    //   - accentColor: string (optional) - User's preferred accent color
+    //   - systemPrompt: string (optional) - User's custom system prompt for Kabboul
+    //   - temperature: number (optional) - User's preferred temperature for Kabboul
+    //   - createdAt: timestamp (required, immutable) - Account creation timestamp
+    //
+    // Collection: chatSessions
+    // Document ID: {sessionId}
+    // Fields:
+    //   - id: string (required, immutable) - Session ID
+    //   - userId: string (required, immutable) - Owner User ID
+    //   - title: string (required) - Chat title
+    //   - date: string (optional) - Formatted date string
+    //   - messages: list (optional) - Chat messages
+    //   - createdAt: timestamp (required, immutable) - Session creation timestamp
+    //
+    // ===============================================================
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isDocOwner() {
+      return isAuthenticated() && request.auth.uid == resource.data.userId;
+    }
+
+    function uidUnchanged() {
+      return !('uid' in request.resource.data) || request.resource.data.uid == request.auth.uid;
+    }
+
+    function uidNotModified() {
+      return !('uid' in request.resource.data) || request.resource.data.uid == resource.data.uid;
+    }
+
+    function userIdUnchanged() {
+      return !('userId' in request.resource.data) || request.resource.data.userId == request.auth.uid;
+    }
+
+    function userIdNotModified() {
+      return !('userId' in request.resource.data) || request.resource.data.userId == resource.data.userId;
+    }
+
+    function hasRequiredFields(fields) {
+      return request.resource.data.keys().hasAll(fields);
+    }
+
+    function hasOnlyAllowedFields(fields) {
+      return request.resource.data.keys().hasOnly(fields);
+    }
+
+    function areImmutableFieldsUnchanged(fields) {
+      return !request.resource.data.diff(resource.data).affectedKeys().hasAny(fields);
+    }
+
+    // Domain Validators
+    function isValidUser(data) {
+      return hasOnlyAllowedFields(['uid', 'theme', 'accentColor', 'systemPrompt', 'temperature', 'createdAt']) &&
+             data.uid is string && data.uid.size() > 0 && data.uid.size() < 100 &&
+             (!('theme' in data) || (data.theme in ['dark', 'light'])) &&
+             (!('accentColor' in data) || (data.accentColor is string && data.accentColor.size() < 20)) &&
+             (!('systemPrompt' in data) || (data.systemPrompt is string && data.systemPrompt.size() < 5000)) &&
+             (!('temperature' in data) || (data.temperature is number && data.temperature >= 0 && data.temperature <= 2)) &&
+             data.createdAt is timestamp;
+    }
+
+    function isValidChatSession(data) {
+      return hasOnlyAllowedFields(['id', 'userId', 'title', 'date', 'messages', 'createdAt']) &&
+             data.id is string && data.id.size() > 0 && data.id.size() < 100 &&
+             data.userId is string && data.userId.size() > 0 && data.userId.size() < 100 &&
+             data.title is string && data.title.size() < 200 &&
+             (!('date' in data) || (data.date is string && data.date.size() < 100)) &&
+             (!('messages' in data) || (data.messages is list && data.messages.size() < 1000)) &&
+             data.createdAt is timestamp;
+    }
+
+    match /users/{userId} {
+      allow read: if isOwner(userId);
+      allow create: if isOwner(userId) && hasRequiredFields(['uid', 'createdAt']) && isValidUser(request.resource.data) && uidUnchanged();
+      allow update: if isOwner(userId) && isValidUser(request.resource.data) && uidNotModified() && areImmutableFieldsUnchanged(['createdAt']);
+      allow delete: if isOwner(userId);
+    }
+
+    match /chatSessions/{sessionId} {
+      // Allow read if the user is the owner, or allow list queries where userId == request.auth.uid
+      allow read: if isDocOwner() || (isAuthenticated() && request.auth.uid == resource.data.userId);
+      allow create: if isAuthenticated() && hasRequiredFields(['id', 'userId', 'title', 'createdAt']) && isValidChatSession(request.resource.data) && userIdUnchanged();
+      allow update: if isDocOwner() && isValidChatSession(request.resource.data) && userIdNotModified() && areImmutableFieldsUnchanged(['id', 'createdAt']);
+      allow delete: if isDocOwner();
+    }
+  }
+}
+
+
+=================================================================
+FILE: package.json
+=================================================================
+
+{
+  "name": "react-example",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx server.ts",
+    "build": "vite build",
+    "preview": "vite preview",
+    "clean": "rm -rf dist",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@google/genai": "^1.29.0",
+    "@tailwindcss/vite": "^4.1.14",
+    "@vitejs/plugin-react": "^5.0.4",
+    "dotenv": "^17.2.3",
+    "express": "^4.21.2",
+    "firebase": "^12.11.0",
+    "jszip": "^3.10.1",
+    "lucide-react": "^0.546.0",
+    "motion": "^12.23.24",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "react-markdown": "^10.1.0",
+    "vite": "^6.2.0"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.14.0",
+    "autoprefixer": "^10.4.21",
+    "tailwindcss": "^4.1.14",
+    "tsx": "^4.21.0",
+    "typescript": "~5.8.2",
+    "vite": "^6.2.0"
+  }
+}
+
+
+=================================================================
+FILE: index.html
+=================================================================
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>My Google AI Studio App</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+
+
+
+=================================================================
+FILE: vite.config.ts
+=================================================================
+
+import tailwindcss from '@tailwindcss/vite';
+import react from '@vitejs/plugin-react';
+import path from 'path';
+import {defineConfig, loadEnv} from 'vite';
+
+export default defineConfig(({mode}) => {
+  const env = loadEnv(mode, '.', '');
+  return {
+    plugins: [react(), tailwindcss()],
+    define: {
+      'process.env.GEMINI_API_KEY': JSON.stringify(env.GEMINI_API_KEY),
+    },
+    resolve: {
+      alias: {
+        '@': path.resolve(__dirname, '.'),
+      },
+    },
+    server: {
+      // HMR is disabled in AI Studio via DISABLE_HMR env var.
+      // Do not modifyâfile watching is disabled to prevent flickering during agent edits.
+      hmr: process.env.DISABLE_HMR !== 'true',
+    },
+  };
+});
+
+
+=================================================================
+FILE: firebase-blueprint.json
+=================================================================
+
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "User profile and settings",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "User ID"
+        },
+        "theme": {
+          "type": "string",
+          "enum": ["dark", "light"],
+          "description": "User's preferred theme"
+        },
+        "accentColor": {
+          "type": "string",
+          "description": "User's preferred accent color"
+        },
+        "systemPrompt": {
+          "type": "string",
+          "description": "User's custom system prompt for Kabboul"
+        },
+        "temperature": {
+          "type": "number",
+          "description": "User's preferred temperature for Kabboul"
+        },
+        "createdAt": {
+          "type": "timestamp",
+          "description": "Account creation timestamp"
+        }
+      },
+      "required": ["uid", "createdAt"]
+    },
+    "ChatSession": {
+      "title": "ChatSession",
+      "description": "A chat session with Kabboul",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Session ID"
+        },
+        "userId": {
+          "type": "string",
+          "description": "Owner User ID"
+        },
+        "title": {
+          "type": "string",
+          "description": "Chat title"
+        },
+        "date": {
+          "type": "string",
+          "description": "Formatted date string"
+        },
+        "messages": {
+          "type": "array",
+          "description": "Serialized chat messages (JSON stringified to avoid complex nested arrays/objects limits if needed, or just array of objects)",
+          "items": {
+            "type": "object"
+          }
+        },
+        "createdAt": {
+          "type": "timestamp",
+          "description": "Session creation timestamp"
+        }
+      },
+      "required": ["id", "userId", "title", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "UserProfile",
+      "description": "User profiles and settings"
+    },
+    "/chatSessions/{sessionId}": {
+      "schema": "ChatSession",
+      "description": "Chat sessions belonging to users"
+    }
+  }
 }
